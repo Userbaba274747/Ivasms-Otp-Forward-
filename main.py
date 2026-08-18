@@ -1,7 +1,8 @@
 import os
 import time
 import re
-import json
+import threading
+from datetime import datetime
 import cloudscraper
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -9,20 +10,20 @@ import requests
 
 load_dotenv()
 
-# ========== CONFIG ==========
+# ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/Global_Method_Channel1")
 IVASMS_EMAIL = os.getenv("IVASMS_EMAIL")
 IVASMS_PASSWORD = os.getenv("IVASMS_PASSWORD")
 
-CHECK_INTERVAL = 12          # সেকেন্ড
+CHECK_INTERVAL = 15          # সেকেন্ড
 DELETE_AFTER = 120           # 2 মিনিট
 BASE_URL = "https://www.ivasms.com"
 
-# ========== HELPERS ==========
+# ================== HELPERS ==================
 def get_service(msg):
-    s = msg.lower()
+    s = (msg or "").lower()
     if "telegram" in s: return "Telegram", "✈️"
     if "facebook" in s: return "Facebook", "📘"
     if "google" in s: return "Google", "🌐"
@@ -37,10 +38,10 @@ def hide_phone(phone):
     return phone[:5] + "****" + phone[-3:]
 
 def extract_otp(msg):
-    match = re.search(r'\b\d{3}[-\s]?\d{3}\b|\b\d{4,8}\b', msg)
+    match = re.search(r'\b\d{3}[-\s]?\d{3}\b|\b\d{4,8}\b', msg or "")
     return match.group(0) if match else "OTP"
 
-# ========== TELEGRAM ==========
+# ================== TELEGRAM ==================
 def delete_message(message_id):
     try:
         requests.post(
@@ -48,8 +49,8 @@ def delete_message(message_id):
             json={"chat_id": CHAT_ID, "message_id": message_id},
             timeout=10
         )
-    except Exception as e:
-        print("Delete error:", e)
+    except:
+        pass
 
 def send_telegram(text, otp):
     try:
@@ -71,18 +72,14 @@ def send_telegram(text, otp):
         )
         data = res.json()
         if data.get("ok") and data["result"].get("message_id"):
-            # 2 মিনিট পর ডিলিট
-            time.sleep(0.5)
-            # setTimeout এর বদলে background এ রাখার জন্য আলাদা থ্রেড ব্যবহার করা ভালো, 
-            # কিন্তু সহজ রাখার জন্য এখানে simple delay দিলাম না। 
-            # চাইলে পরে threading যোগ করা যাবে।
-            import threading
             threading.Timer(DELETE_AFTER, delete_message, args=[data["result"]["message_id"]]).start()
-            print("✅ Message sent & scheduled for delete")
+            print("✅ Sent to Telegram")
+            return True
     except Exception as e:
-        print("Telegram send error:", e)
+        print("Telegram error:", e)
+    return False
 
-# ========== IVASMS CLIENT ==========
+# ================== IVASMS CLIENT ==================
 class IvaSMS:
     def __init__(self):
         self.scraper = cloudscraper.create_scraper(
@@ -95,17 +92,15 @@ class IvaSMS:
     def login(self):
         print("🔐 Logging in to ivasms.com ...")
         try:
-            # Step 1: Get login page
-            r = self.scraper.get(f"{BASE_URL}/login", timeout=20)
-            soup = BeautifulSoup(r.text, "lxml")
-            token = soup.find("input", {"name": "_token"})
-            if not token:
-                print("❌ CSRF token not found on login page")
+            r = self.scraper.get(f"{BASE_URL}/login", timeout=25)
+            soup = BeautifulSoup(r.text, "html.parser")
+            token_input = soup.find("input", {"name": "_token"})
+            if not token_input:
+                print("❌ CSRF token not found")
                 return False
 
-            self.csrf = token.get("value")
+            self.csrf = token_input.get("value")
 
-            # Step 2: Submit login
             payload = {
                 "email": IVASMS_EMAIL,
                 "password": IVASMS_PASSWORD,
@@ -115,101 +110,149 @@ class IvaSMS:
                 "Referer": f"{BASE_URL}/login",
                 "Origin": BASE_URL
             }
-            r2 = self.scraper.post(f"{BASE_URL}/login", data=payload, headers=headers, timeout=20)
+            r2 = self.scraper.post(f"{BASE_URL}/login", data=payload, headers=headers, timeout=25)
 
-            if "portal" in r2.url or r2.status_code == 200:
-                # Check if really logged in
-                check = self.scraper.get(f"{BASE_URL}/portal/live/my_sms", timeout=15)
-                if "logout" in check.text.lower() or "my_sms" in check.url:
-                    self.logged_in = True
-                    print("✅ Login successful!")
-                    return True
+            # Login সফল কিনা চেক
+            check = self.scraper.get(f"{BASE_URL}/portal", timeout=20)
+            if "logout" in check.text.lower() or "/portal" in check.url:
+                self.logged_in = True
+                print("✅ Login successful!")
+                return True
 
-            print("❌ Login failed. Check email/password or Cloudflare blocked.")
+            print("❌ Login failed. Email/Password বা Cloudflare সমস্যা হতে পারে।")
             return False
 
         except Exception as e:
             print("Login error:", e)
             return False
 
-    def get_live_sms(self):
+    def get_today_sms(self):
+        """আজকের সব SMS আনে"""
         if not self.logged_in:
             if not self.login():
                 return []
 
-        try:
-            r = self.scraper.get(f"{BASE_URL}/portal/live/my_sms", timeout=20)
-            soup = BeautifulSoup(r.text, "lxml")
+        today = datetime.now().strftime("%Y-%m-%d")
+        print(f"📥 Fetching SMS for {today} ...")
 
+        try:
+            # প্রথমে received পেজে যাই
+            r = self.scraper.get(f"{BASE_URL}/portal/sms/received", timeout=25)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # CSRF আবার নিই
+            token_input = soup.find("input", {"name": "_token"})
+            if token_input:
+                self.csrf = token_input.get("value")
+
+            # Date দিয়ে SMS আনার চেষ্টা
+            payload = {
+                "from": today,
+                "to": today,
+                "_token": self.csrf or ""
+            }
+            headers = {
+                "Referer": f"{BASE_URL}/portal/sms/received",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": BASE_URL
+            }
+
+            r2 = self.scraper.post(
+                f"{BASE_URL}/portal/sms/received",
+                data=payload,
+                headers=headers,
+                timeout=25
+            )
+
+            soup2 = BeautifulSoup(r2.text, "html.parser")
             messages = []
-            rows = soup.select("table tbody tr") or soup.select("tr")
+
+            # টেবিল থেকে ডেটা বের করা
+            rows = soup2.select("table tbody tr") or soup2.select("tr")
 
             for row in rows:
                 cols = row.find_all("td")
-                if len(cols) < 5:
+                if len(cols) < 3:
                     continue
 
-                live = cols[0].get_text(strip=True)
-                sid = cols[1].get_text(strip=True)
-                msg = cols[4].get_text(strip=True)
+                # বিভিন্ন কলাম ট্রাই করা
+                text_content = row.get_text(" ", strip=True)
+                phone_match = re.search(r'\b\d{9,15}\b', text_content)
+                phone = phone_match.group(0) if phone_match else "Unknown"
 
-                if not msg or len(msg) < 5:
+                # মেসেজ খোঁজা
+                msg = ""
+                for col in cols:
+                    t = col.get_text(strip=True)
+                    if len(t) > 10 and any(c.isdigit() for c in t):
+                        msg = t
+                        break
+
+                if not msg:
+                    msg = text_content
+
+                if len(msg) < 8:
                     continue
 
-                uid = f"{live}_{msg}"
+                uid = f"{phone}_{msg[:40]}"
                 if uid in self.seen:
                     continue
 
                 self.seen.add(uid)
-                if len(self.seen) > 200:
-                    self.seen = set(list(self.seen)[-100:])
-
-                phone_match = re.search(r'\d{8,15}', live)
-                phone = phone_match.group(0) if phone_match else live
-
                 messages.append({
                     "phone": phone,
-                    "service_raw": sid,
                     "msg": msg
                 })
 
+            print(f"✅ Found {len(messages)} new SMS")
             return messages
 
         except Exception as e:
-            print("Fetch SMS error:", e)
+            print("Fetch error:", e)
             self.logged_in = False
             return []
 
-# ========== MAIN LOOP ==========
+# ================== MAIN ==================
 def main():
     if not all([BOT_TOKEN, CHAT_ID, IVASMS_EMAIL, IVASMS_PASSWORD]):
-        print("❌ Missing environment variables!")
+        print("❌ Environment variables missing!")
+        print("BOT_TOKEN, CHAT_ID, IVASMS_EMAIL, IVASMS_PASSWORD সব সেট করো")
         return
 
     client = IvaSMS()
-    print("🚀 IVA SMS Forwarder started on Railway...")
+    print("🚀 IVA SMS Forwarder started...")
+    print("📅 আজকের সব SMS পাঠানো হবে + নতুন SMS মনিটর করা হবে")
+
+    # প্রথমে আজকের সব SMS পাঠায়
+    first_run = True
 
     while True:
         try:
-            msgs = client.get_live_sms()
+            msgs = client.get_today_sms()
+
             for item in msgs:
                 name, emoji = get_service(item["msg"])
                 hidden = hide_phone(item["phone"])
                 prefix = item["phone"][:5] if len(item["phone"]) >= 5 else item["phone"]
                 otp = extract_otp(item["msg"])
-                clean_msg = item["msg"].replace("<", "&lt;").replace(">", "&gt;")
+                clean = item["msg"].replace("<", "&lt;").replace(">", "&gt;")
 
                 text = (
-                    f"{emoji} <b>{name}</b> 🌐\n"
+                    f"{emoji} <b>{name}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📱 <b>Number:</b> <code>{hidden}</code>\n"
                     f"🔍 <b>Prefix:</b> <code>+{prefix}</code>\n"
                     f"🔑 <b>OTP:</b> <code>{otp}</code>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<blockquote>{clean_msg}</blockquote>\n"
-                    f"⏳ <i>This message will auto-delete in 2 minutes</i>"
+                    f"<blockquote>{clean}</blockquote>\n"
+                    f"⏳ <i>Auto-delete in 2 minutes</i>"
                 )
                 send_telegram(text, otp)
+                time.sleep(1.2)  # rate limit এড়াতে
+
+            if first_run:
+                print("✅ আজকের সব SMS পাঠানো শেষ। এখন নতুন SMS মনিটর করছি...")
+                first_run = False
 
         except Exception as e:
             print("Main loop error:", e)
