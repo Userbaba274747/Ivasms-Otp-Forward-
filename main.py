@@ -17,8 +17,8 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/Global_Method_Channel1")
 IVASMS_EMAIL = os.getenv("IVASMS_EMAIL")
 IVASMS_PASSWORD = os.getenv("IVASMS_PASSWORD")
 
-CHECK_INTERVAL = 15          # সেকেন্ড
-DELETE_AFTER = 120           # 2 মিনিট
+CHECK_INTERVAL = 20
+DELETE_AFTER = 120
 BASE_URL = "https://www.ivasms.com"
 
 # ================== HELPERS ==================
@@ -75,6 +75,8 @@ def send_telegram(text, otp):
             threading.Timer(DELETE_AFTER, delete_message, args=[data["result"]["message_id"]]).start()
             print("✅ Sent to Telegram")
             return True
+        else:
+            print("Telegram response:", data)
     except Exception as e:
         print("Telegram error:", e)
     return False
@@ -83,7 +85,13 @@ def send_telegram(text, otp):
 class IvaSMS:
     def __init__(self):
         self.scraper = cloudscraper.create_scraper(
-            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True,
+                'mobile': False
+            },
+            delay=10
         )
         self.logged_in = False
         self.csrf = None
@@ -92,42 +100,100 @@ class IvaSMS:
     def login(self):
         print("🔐 Logging in to ivasms.com ...")
         try:
-            r = self.scraper.get(f"{BASE_URL}/login", timeout=25)
+            # প্রথমে হোমপেজ
+            self.scraper.get(BASE_URL, timeout=30)
+            time.sleep(2)
+
+            # লগইন পেজ
+            r = self.scraper.get(f"{BASE_URL}/login", timeout=30)
+            print(f"Login page status: {r.status_code}")
+            print(f"Final URL: {r.url}")
+
+            # ডিবাগ: পেজের প্রথম অংশ দেখাই
+            print("Page preview (first 400 chars):")
+            print(r.text[:400])
+            print("-----")
+
             soup = BeautifulSoup(r.text, "html.parser")
-            token_input = soup.find("input", {"name": "_token"})
-            if not token_input:
-                print("❌ CSRF token not found")
+
+            # বিভিন্ন সম্ভাব্য টোকেন খোঁজা
+            token = None
+            for name in ["_token", "csrf_token", "csrf", "_csrf", "token"]:
+                tag = soup.find("input", {"name": name})
+                if tag and tag.get("value"):
+                    token = tag.get("value")
+                    print(f"✅ Found token with name: {name}")
+                    break
+
+            if not token:
+                # meta ট্যাগ থেকেও চেষ্টা
+                meta = soup.find("meta", {"name": "csrf-token"})
+                if meta:
+                    token = meta.get("content")
+                    print("✅ Found token from meta tag")
+
+            if not token:
+                print("❌ CSRF token still not found")
+                # পুরো ফর্ম দেখাই
+                forms = soup.find_all("form")
+                print(f"Found {len(forms)} form(s)")
+                for i, f in enumerate(forms):
+                    print(f"Form {i}:", f.get("action"), f.get("method"))
                 return False
 
-            self.csrf = token_input.get("value")
+            self.csrf = token
 
             payload = {
                 "email": IVASMS_EMAIL,
                 "password": IVASMS_PASSWORD,
                 "_token": self.csrf
             }
+
+            # অনেক সময় email এর বদলে username ফিল্ড থাকে
+            # দুইটাই পাঠাচ্ছি
+            payload["username"] = IVASMS_EMAIL
+
             headers = {
                 "Referer": f"{BASE_URL}/login",
-                "Origin": BASE_URL
+                "Origin": BASE_URL,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
-            r2 = self.scraper.post(f"{BASE_URL}/login", data=payload, headers=headers, timeout=25)
 
-            # Login সফল কিনা চেক
-            check = self.scraper.get(f"{BASE_URL}/portal", timeout=20)
-            if "logout" in check.text.lower() or "/portal" in check.url:
+            print("Submitting login form...")
+            r2 = self.scraper.post(
+                f"{BASE_URL}/login",
+                data=payload,
+                headers=headers,
+                timeout=30,
+                allow_redirects=True
+            )
+
+            print(f"After login status: {r2.status_code}")
+            print(f"After login URL: {r2.url}")
+
+            # সফল কিনা চেক
+            if "/portal" in r2.url or "logout" in r2.text.lower() or "dashboard" in r2.text.lower():
                 self.logged_in = True
                 print("✅ Login successful!")
                 return True
 
-            print("❌ Login failed. Email/Password বা Cloudflare সমস্যা হতে পারে।")
+            # আরেকবার portal চেক
+            check = self.scraper.get(f"{BASE_URL}/portal", timeout=20)
+            if "logout" in check.text.lower() or "/portal" in check.url:
+                self.logged_in = True
+                print("✅ Login successful (second check)!")
+                return True
+
+            print("❌ Login failed")
+            print("Response preview:", r2.text[:300])
             return False
 
         except Exception as e:
-            print("Login error:", e)
+            print("Login exception:", str(e))
             return False
 
     def get_today_sms(self):
-        """আজকের সব SMS আনে"""
         if not self.logged_in:
             if not self.login():
                 return []
@@ -136,16 +202,13 @@ class IvaSMS:
         print(f"📥 Fetching SMS for {today} ...")
 
         try:
-            # প্রথমে received পেজে যাই
-            r = self.scraper.get(f"{BASE_URL}/portal/sms/received", timeout=25)
+            r = self.scraper.get(f"{BASE_URL}/portal/sms/received", timeout=30)
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # CSRF আবার নিই
             token_input = soup.find("input", {"name": "_token"})
             if token_input:
                 self.csrf = token_input.get("value")
 
-            # Date দিয়ে SMS আনার চেষ্টা
             payload = {
                 "from": today,
                 "to": today,
@@ -161,40 +224,25 @@ class IvaSMS:
                 f"{BASE_URL}/portal/sms/received",
                 data=payload,
                 headers=headers,
-                timeout=25
+                timeout=30
             )
 
             soup2 = BeautifulSoup(r2.text, "html.parser")
             messages = []
 
-            # টেবিল থেকে ডেটা বের করা
             rows = soup2.select("table tbody tr") or soup2.select("tr")
+            print(f"Found {len(rows)} rows")
 
             for row in rows:
-                cols = row.find_all("td")
-                if len(cols) < 3:
+                text_content = row.get_text(" ", strip=True)
+                if len(text_content) < 15:
                     continue
 
-                # বিভিন্ন কলাম ট্রাই করা
-                text_content = row.get_text(" ", strip=True)
                 phone_match = re.search(r'\b\d{9,15}\b', text_content)
                 phone = phone_match.group(0) if phone_match else "Unknown"
 
-                # মেসেজ খোঁজা
-                msg = ""
-                for col in cols:
-                    t = col.get_text(strip=True)
-                    if len(t) > 10 and any(c.isdigit() for c in t):
-                        msg = t
-                        break
-
-                if not msg:
-                    msg = text_content
-
-                if len(msg) < 8:
-                    continue
-
-                uid = f"{phone}_{msg[:40]}"
+                msg = text_content
+                uid = f"{phone}_{msg[:50]}"
                 if uid in self.seen:
                     continue
 
@@ -204,7 +252,7 @@ class IvaSMS:
                     "msg": msg
                 })
 
-            print(f"✅ Found {len(messages)} new SMS")
+            print(f"✅ New SMS found: {len(messages)}")
             return messages
 
         except Exception as e:
@@ -215,15 +263,13 @@ class IvaSMS:
 # ================== MAIN ==================
 def main():
     if not all([BOT_TOKEN, CHAT_ID, IVASMS_EMAIL, IVASMS_PASSWORD]):
-        print("❌ Environment variables missing!")
-        print("BOT_TOKEN, CHAT_ID, IVASMS_EMAIL, IVASMS_PASSWORD সব সেট করো")
+        print("❌ Missing environment variables!")
         return
 
     client = IvaSMS()
     print("🚀 IVA SMS Forwarder started...")
-    print("📅 আজকের সব SMS পাঠানো হবে + নতুন SMS মনিটর করা হবে")
+    print("📅 আজকের সব SMS + নতুন SMS মনিটর করা হবে")
 
-    # প্রথমে আজকের সব SMS পাঠায়
     first_run = True
 
     while True:
@@ -248,14 +294,14 @@ def main():
                     f"⏳ <i>Auto-delete in 2 minutes</i>"
                 )
                 send_telegram(text, otp)
-                time.sleep(1.2)  # rate limit এড়াতে
+                time.sleep(1.5)
 
             if first_run:
-                print("✅ আজকের সব SMS পাঠানো শেষ। এখন নতুন SMS মনিটর করছি...")
+                print("✅ প্রথম রাউন্ড শেষ। এখন নতুন SMS মনিটর করছি...")
                 first_run = False
 
         except Exception as e:
-            print("Main loop error:", e)
+            print("Main error:", e)
 
         time.sleep(CHECK_INTERVAL)
 
